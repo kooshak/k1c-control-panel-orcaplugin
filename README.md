@@ -29,18 +29,18 @@
 ## ✨ Features
 
 ### 🎛 Control
-- **Live telemetry** — nozzle, bed, chamber, position, print status in real-time
-- **Temperatures** — nozzle (0–320°C), bed (0–115°C), chamber, quick presets for PLA/PETG/ASA/TPU
-- **Fans** — model fan, chassis fan, side fan (0–100%)
-- **LED light** — on/off control
-- **Motion modes** — Silent / Stable / Standard / Hyper
+- **Live telemetry** - nozzle, bed, chamber, position, print status in real-time
+- **Temperatures** - nozzle (0–320°C), bed (0–115°C), chamber, quick presets for PLA/PETG/ASA/TPU
+- **Fans** - model fan, chassis fan, side fan (0–100%)
+- **LED light** - on/off control
+- **Motion modes** - Silent / Stable / Standard / Hyper
 
 ### 🎥 Camera
-- **WebRTC** — native stream via signaling on port 8000 (H.264, low-latency)
-- **MJPEG** — direct and relay modes for compatibility
-- **Settings** — zoom, rotation, H/V flip, brightness, contrast, saturation
-- **Overlays** — HUD with telemetry, rule-of-thirds grid
-- **Snapshots** — save JPEG to plugin folder with preview and delete
+- **WebRTC** - native stream via signaling on port 8000 (H.264, low-latency)
+- **MJPEG** - direct and relay modes for compatibility
+- **Settings** - zoom, rotation, H/V flip, brightness, contrast, saturation
+- **Overlays** - HUD with telemetry, rule-of-thirds grid
+- **Snapshots** - save JPEG to plugin folder with preview and delete
 
 ### 📁 Files
 - Thumbnails with lazy loading
@@ -110,7 +110,6 @@
 - **Printer**: Creality K1C 2025 (Klipper + Moonraker + DWIN firmware)
 - **Network**: printer and computer on the same subnet
 
-
 ---
 
 ## 📥 Installation
@@ -145,7 +144,7 @@
 - Check that the printer and computer are on the same subnet
 - Make sure the IP in Diagnostics is correct
 - Try the **Reconnect** button
-- Check **Test HTTP** — Moonraker should respond
+- Check **Test HTTP** - Moonraker should respond
 
 ### Camera doesn't show video
 - Make sure the camera is physically connected to the printer
@@ -171,9 +170,10 @@ The plugin was tested on K1C 2025. K1 and K1 Max have a similar protocol but may
 ---
 
 
-- [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) — for the Plugin API
-- [Creality](https://www.creality.com/) — for K1C and the open protocol
-- [Klipper](https://www.klipper3d.org/) — for the firmware
-- [Moonraker](https://moonraker.readthedocs.io/) — for the HTTP API
+- [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) - for the Plugin API
+- [Creality](https://www.creality.com/) - for K1C and the open protocol
+- [Klipper](https://www.klipper3d.org/) - for the firmware
+- [Moonraker](https://moonraker.readthedocs.io/) - for the HTTP API
+- [Orca Cloud Plugin](https://cloud.orcaslicer.com/p/5058f996df40) - K1C Control Panel Plugin
 
 ---
