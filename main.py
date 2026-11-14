@@ -3,7 +3,7 @@
 # name = "K1C Hub"
 # description = "Control your Creality K1C directly from OrcaSlicer: live telemetry, WebRTC camera, file manager, print history, motion control and calibration over native WebSocket with Moonraker fallback."
 # author = "kczk"
-# version = "0.9.0 beta"
+# version = "1.1.0"
 # ///
 
 import orca
@@ -58,7 +58,9 @@ CFG = {
     "cam_bright": 100, "cam_contrast": 100, "cam_sat": 100,
     "cam_grid": False, "cam_hud": True,
     "pid_nozzle": 220, "pid_bed": 60, "last_heat": 200,
+    "ui_lang": "auto",
     "media_base": "", "media_prefix": "", "media_strip": 0,
+    "media_img_prefix": "",
 }
 
 LINK = {
@@ -137,7 +139,16 @@ def load_cfg():
                 CFG[key] = data[key]
     except Exception:
         pass
-
+    # Prepare the shared-state holder early so non-WS threads (motion, run,
+    # thumb) can register themselves here and survive a module reimport.
+    try:
+        import sys
+        if getattr(sys, "_k1c_shared_v2", None) is None:
+            setattr(sys, "_k1c_shared_v2", {
+                "link": LINK, "cfg": CFG, "lock": LOCK, "gen": 0,
+            })
+    except Exception:
+        pass
 
 def save_cfg():
     try:
@@ -237,6 +248,14 @@ def run_worker():
 def ensure_run_thread():
     if threading is None:
         return False
+    import sys
+    shared = getattr(sys, "_k1c_shared_v2", None)
+    if shared is not None:
+        th = shared.get("run_thread")
+        if th is not None and getattr(th, "is_alive", lambda: False)():
+            with LOCK:
+                RUN["thread"] = th
+            return True
     with LOCK:
         th = RUN["thread"]
         if th is not None and th.is_alive():
@@ -244,9 +263,10 @@ def ensure_run_thread():
         th = threading.Thread(target=run_worker)
         th.daemon = True
         RUN["thread"] = th
-    th.start()
-    return True
-
+        if shared is not None:
+            shared["run_thread"] = th
+        th.start()
+        return True
 
 def gcode_async(script, label, timeout=60, long=False):
     if not ensure_run_thread():
@@ -369,6 +389,16 @@ def motion_worker():
 def ensure_motion_thread():
     if threading is None:
         return
+    import sys
+    shared = getattr(sys, "_k1c_shared_v2", None)
+    # Reuse motion thread from a previous module reload if it is still alive.
+    # The shared dict survives module reimports, local LINK does not.
+    if shared is not None:
+        th = shared.get("motion_thread")
+        if th is not None and getattr(th, "is_alive", lambda: False)():
+            with LOCK:
+                LINK["motion_thread"] = th
+            return
     with LOCK:
         th = LINK["motion_thread"]
         if th is not None and th.is_alive():
@@ -376,7 +406,9 @@ def ensure_motion_thread():
         th = threading.Thread(target=motion_worker)
         th.daemon = True
         LINK["motion_thread"] = th
-    th.start()
+        if shared is not None:
+            shared["motion_thread"] = th
+        th.start()
 
 
 def caps_worker():
@@ -678,15 +710,23 @@ def files_update(raw):
 
 
 def media_url(abs_path):
-    base = CFG.get("media_base", "")
-    if not base or not abs_path:
+    if not abs_path:
         return ""
+    base = CFG.get("media_base", "") or ("http://" + str(CFG.get("ip", "")))
+    base = base.rstrip("/")
+    low = str(abs_path).lower()
+    is_video = low.endswith(".mp4") or low.endswith(".avi") or low.endswith(".mkv")
+    if is_video:
+        prefix = CFG.get("media_prefix", "") or "/downloads/video/"
+    else:
+        prefix = CFG.get("media_img_prefix", "") or "/downloads/image/"
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
     strip = to_int(CFG.get("media_strip", 0))
-    prefix = CFG.get("media_prefix", "")
     p = abs_path[strip:] if strip > 0 else abs_path
     if not p.startswith("/"):
         p = "/" + p
-    return base + prefix + urllib.parse.quote(p, safe="/")
+    return base + prefix + urllib.parse.quote(p, safe="")
 
 
 def history_update(msg):
@@ -820,6 +860,14 @@ def thumb_worker():
 def ensure_thumb_thread():
     if threading is None or base64 is None:
         return
+    import sys
+    shared = getattr(sys, "_k1c_shared_v2", None)
+    if shared is not None:
+        th = shared.get("thumb_thread")
+        if th is not None and getattr(th, "is_alive", lambda: False)():
+            with LOCK:
+                THUMB["thread"] = th
+            return
     with LOCK:
         th = THUMB["thread"]
         if th is not None and th.is_alive():
@@ -827,7 +875,9 @@ def ensure_thumb_thread():
         th = threading.Thread(target=thumb_worker)
         th.daemon = True
         THUMB["thread"] = th
-    th.start()
+        if shared is not None:
+            shared["thumb_thread"] = th
+        th.start()
 
 
 def collect_thumbs(wanted):
@@ -1060,8 +1110,6 @@ def cam_candidates():
     return [
         ("8000 \xc2\xb7 MJPEG", "http://{ip}:8000/webcam/?action=stream".format(ip=ip), "mjpeg"),
         ("8000 \xc2\xb7 snapshot", "http://{ip}:8000/webcam/?action=snapshot".format(ip=ip), "snapshot"),
-        ("4409 \xc2\xb7 MJPEG", "http://{ip}:4409/?action=stream".format(ip=ip), "mjpeg"),
-        ("4409 \xc2\xb7 snapshot", "http://{ip}:4409/?action=snapshot".format(ip=ip), "snapshot"),
         ("8080 \xc2\xb7 MJPEG", "http://{ip}:8080/?action=stream".format(ip=ip), "mjpeg"),
         ("Moonraker \xc2\xb7 webcam", "http://{ip}:7125/webcam/?action=stream".format(ip=ip), "mjpeg"),
     ]
@@ -1501,6 +1549,7 @@ def ws_worker(my_gen):
             backoff = 1.0
             started = time.time()
             last_rx = time.time()
+            last_tx = time.time()
             frag = b""
             while (not LINK["stop"] and not LINK["force_reconnect"]
                    and (shared is None or shared.get("gen") == my_gen)):
@@ -1514,7 +1563,14 @@ def ws_worker(my_gen):
                         continue
                     payload = json.dumps(item)
                     send_frame(sock, 0x1, payload)
+                    last_tx = time.time()
                     log("WS -> " + payload[:200])
+                if time.time() - last_tx > 20:
+                    try:
+                        send_frame(sock, 0x9, b"")
+                        last_tx = time.time()
+                    except Exception:
+                        pass
                 drained = 0
                 while drained < 400:
                     ready, _, _ = select.select([sock], [], [], 0 if drained else 0.2)
@@ -1752,7 +1808,7 @@ def snapshot():
             "max_bed": to_int(s.get("maxBedTemp", 115)),
             "progress": to_int(s.get("printProgress", 0)),
             "layer": to_int(s.get("layer", 0)) if active else 0,
-            "total_layer": to_int(s.get("TotalLayer", 0)) if active else 0,
+            "total_layer": to_int(s.get("Total Layer", s.get("TotalLayer", 0))) if active else 0,
             "print_time": fmt_dur(s.get("printJobTime", 0)) if active else "--",
             "time_left": fmt_dur(s.get("printLeftTime", 0)) if active else "--",
             "state": state_key(raw_state), "state_raw": raw_state,
@@ -1794,15 +1850,7 @@ class K1CControlPage(orca.pages.PagesPluginCapabilityBase):
         return "K1C Hub"
 
     def get_ui(self):
-        lang = "en"
-        try:
-            ui_lang = orca.host.app_info().ui_language
-            if ui_lang.startswith("ru"):
-                lang = "ru"
-            elif ui_lang.startswith("zh"):
-                lang = "zh"
-        except Exception:
-            lang = "en"
+        lang = resolve_ui_lang(self)
 
         translations = {
             "en": {
@@ -1811,7 +1859,7 @@ class K1CControlPage(orca.pages.PagesPluginCapabilityBase):
                 "sub_main": "Dashboard", "sub_calib": "Calibration",
                 "ws": "WebSocket", "http": "HTTP fallback", "offline": "Offline",
                 "reconnecting": "reconnecting", "sound_on": "Sound on", "sound_off": "Muted",
-                "telemetry": "Live telemetry", "auto": "AUTO",
+                "telemetry": "Telemetry", "auto": "AUTO",
                 "nozzle": "Nozzle", "bed": "Bed", "chamber": "Chamber", "target": "target",
                 "layer": "Layer", "elapsed": "Elapsed", "left": "Remaining", "flow": "Flow",
                 "standby": "Standby", "printing": "Printing", "paused": "Paused",
@@ -2338,6 +2386,53 @@ input[type=range].vio::-webkit-slider-thumb { background: linear-gradient(140deg
 .chip.sm { padding: 4px 8px; font-size: 10.5px; }
 .chip:disabled { opacity: 0.32; cursor: not-allowed; }
 
+.jico { display: block; width: 30px; height: 30px; flex: none; overflow: visible; }
+.jico path { fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round;
+transition: stroke-width .14s ease; }
+.jico .jbed { opacity: .42; stroke-width: 2; }
+.jnudge { transition: transform .18s cubic-bezier(.34,1.4,.64,1); }
+.jogpad .jog { font-size: 0; }
+.jogpad .jog.home { font-size: 14px; letter-spacing: .5px; }
+.jogpad .jog:not(.home) .jico { filter: drop-shadow(0 2px 7px rgba(177,140,255,0.32)); }
+.jogpad .jog:not(.home):hover:not(:disabled) .jico path { stroke-width: 2.7; }
+.jogpad .jog:not(.home):hover:not(:disabled) .jnudge { transform: translateY(-2.4px); }
+.jogpad .jog:not(.home):active:not(:disabled) .jnudge { transform: translateY(-0.5px); }
+.zcol .zbtn { min-height: 54px; }
+.zcol .zbtn span:first-child { display: flex; align-items: center; justify-content: center; font-size: 0; line-height: 0; }
+.zcol .zbtn .jico { width: 26px; height: 26px; }
+.zcol .zbtn:hover:not(:disabled) .jico path { stroke-width: 2.7; }
+.zcol .zbtn:hover:not(:disabled) .jnudge { transform: translateY(-2px); }
+.zcol .zbtn#z-down:hover:not(:disabled) .jnudge { transform: translateY(2px); }
+.jogsets { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin-top: 12px; }
+.jogset { position: relative; padding: 11px 11px 12px 14px; border-radius: 12px;
+background: rgba(0,0,0,0.22); border: 1px solid var(--line); overflow: hidden; }
+.jogset:before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+.jogset.xy { border-color: rgba(177,140,255,0.28); }
+.jogset.xy:before { background: linear-gradient(180deg, var(--v1), var(--m1)); }
+.jogset.zz { border-color: rgba(79,227,255,0.28); }
+.jogset.zz:before { background: linear-gradient(180deg, var(--t1), var(--c1)); }
+.jshead { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.jsax { font-size: 10px; font-weight: 800; letter-spacing: 1.3px; padding: 3px 8px; border-radius: 6px; flex: none; }
+.jogset.xy .jsax { background: rgba(177,140,255,0.18); color: var(--v1); }
+.jogset.zz .jsax { background: rgba(79,227,255,0.16); color: var(--c1); }
+.jsnow { flex: 1; min-width: 0; text-align: right; font-size: 11px; font-weight: 700; color: var(--fg);
+font-family: Consolas, monospace; letter-spacing: .2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+text-shadow: 0 1px 2px rgba(0,0,0,0.45); }
+.zcol .zbtn.zhome { background: var(--grad-pri); color: #fff; border-color: transparent;
+font-size: 15px; font-weight: 800; letter-spacing: .6px; text-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+.zcol .zbtn.zhome:hover:not(:disabled) { background: var(--grad-pri); color: #fff; border-color: transparent;
+filter: brightness(1.12); transform: translateY(-1px); box-shadow: 0 6px 18px rgba(177,140,255,0.30); }
+.zcol .zbtn.zhome:active:not(:disabled) { transform: translateY(0) scale(0.97); }
+.zcol .zbtn.zhome:disabled { filter: grayscale(0.55); }
+.jogset .row { margin-bottom: 11px; }
+.jogset .row:last-child { margin-bottom: 0; }
+.jogset .rlabel { margin-bottom: 6px; font-size: 10.5px; }
+.jogset .rlabel b { font-size: 11px; }
+.jogset .chips { display: grid; gap: 5px; }
+.jogset .chips.steps { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.jogset .chips.speeds { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.jogset .chip { width: 100%; min-width: 0; padding: 5px 2px; font-size: 10.5px; text-align: center; }
+@media (max-width: 560px) { .jogsets { grid-template-columns: 1fr; } }
 .jogwrap { display: grid; grid-template-columns: minmax(0,1fr) 108px; gap: 12px; }
 .jogpad { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 1fr);
   gap: 6px; aspect-ratio: 1 / 1; }
@@ -2472,7 +2567,62 @@ input[type=range].vio::-webkit-slider-thumb { background: linear-gradient(140deg
   background: rgba(177,140,255,0.18); color: var(--v1); flex: none; }
 video { width: 100%; border-radius: 10px; background: #000; margin-bottom: 12px; display: block; }
 .cam-layout { display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 16px; align-items: start; }
-.cam-stage { position: relative; width: 100%; aspect-ratio: 4 / 3; border-radius: 14px; overflow: hidden;
+.ipm-wrap { position: relative; display: inline-flex; align-items: center; }
+.ipm-btn { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 11px; border-radius: 999px;
+border: 1px solid rgba(139,92,246,.45); background: linear-gradient(135deg, rgba(139,92,246,.22), rgba(34,211,238,.12));
+color: #e8eaf0; font: inherit; font-size: 12px; font-weight: 600; letter-spacing: .2px; cursor: pointer; white-space: nowrap;
+transition: border-color .16s ease, box-shadow .16s ease, transform .12s ease; }
+.ipm-btn:hover { border-color: rgba(139,92,246,.9); box-shadow: 0 0 0 3px rgba(139,92,246,.15); }
+.ipm-btn:active { transform: translateY(1px); }
+.ipm-btn.bad { border-color: rgba(248,113,113,.65); animation: ipmPulse 1.9s ease-in-out infinite; }
+@keyframes ipmPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(248,113,113,.30); } 50% { box-shadow: 0 0 0 7px rgba(248,113,113,0); } }
+.ipm-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: #9aa3b2; box-shadow: 0 0 0 3px rgba(154,163,178,.16); }
+.ipm-dot.ok { background: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,.18); }
+.ipm-dot.bad { background: #f87171; box-shadow: 0 0 0 3px rgba(248,113,113,.18); }
+.ipm-dot.warn { background: #fbbf24; box-shadow: 0 0 0 3px rgba(251,191,36,.18); }
+.ipm-btn.warn { border-color: rgba(251,191,36,.60); }
+.ipm-state-txt.warn { color: #fbbf24; }
+.ipm-note { display: none; margin-top: 10px; padding: 9px 11px; border-radius: 9px; font-size: 10.5px;
+line-height: 1.5; color: #c9cfdd; background: rgba(248,113,113,.09); border: 1px solid rgba(248,113,113,.28); }
+.ipm-note.show { display: block; }
+.ipm-note.warn { background: rgba(251,191,36,.09); border-color: rgba(251,191,36,.28); }
+.ipm-note b { color: #e8eaf0; font-weight: 700; }
+.ipm-err { margin-top: 6px; font-family: Consolas, monospace; font-size: 9.5px; color: #9aa3b2; word-break: break-all; }
+.ipm-lab { font-variant-numeric: tabular-nums; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.ipm-car { opacity: .55; font-size: 9px; }
+.ipm-scrim { position: fixed; inset: 0; z-index: 9998; background: rgba(8,9,13,.45); }
+.ipm-pop { position: fixed; z-index: 9999; width: 322px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px);
+overflow-y: auto; padding: 16px; border-radius: 16px; border: 1px solid rgba(255,255,255,.10);
+background: linear-gradient(160deg, #1b1e27 0%, #14161d 100%); box-shadow: 0 18px 50px rgba(0,0,0,.55); color: #e8eaf0; }
+.ipm-h { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; font-size: 13px; font-weight: 700; }
+.ipm-h i { display: block; width: 3px; height: 14px; border-radius: 2px; background: linear-gradient(180deg, #8b5cf6, #22d3ee); }
+.ipm-sub { font-size: 11px; line-height: 1.55; color: #9aa3b2; margin-bottom: 12px; }
+.ipm-field { display: flex; gap: 8px; align-items: center; }
+.ipm-inp { flex: 1 1 auto; min-width: 0; height: 36px; padding: 0 11px; border-radius: 10px;
+border: 1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.30); color: #e8eaf0; font: inherit; font-size: 13px;
+font-variant-numeric: tabular-nums; outline: none; transition: border-color .15s ease, box-shadow .15s ease; }
+.ipm-inp:focus { border-color: rgba(139,92,246,.85); box-shadow: 0 0 0 3px rgba(139,92,246,.16); }
+.ipm-inp.err { border-color: rgba(248,113,113,.85); box-shadow: 0 0 0 3px rgba(248,113,113,.15); }
+.ipm-go { flex: none; height: 36px; padding: 0 15px; border-radius: 10px; border: 1px solid rgba(139,92,246,.55);
+background: linear-gradient(135deg, #8b5cf6, #6d5cf6); color: #fff; font: inherit; font-size: 12px; font-weight: 700;
+cursor: pointer; transition: filter .15s ease; }
+.ipm-go:hover { filter: brightness(1.12); }
+.ipm-go:disabled { opacity: .55; cursor: default; filter: none; }
+.ipm-msg { min-height: 15px; margin-top: 8px; font-size: 11px; line-height: 1.4; color: #f87171; }
+.ipm-msg.ok { color: #34d399; }
+.ipm-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+margin-top: 12px; padding-top: 11px; border-top: 1px solid rgba(255,255,255,.07); }
+.ipm-state { display: flex; align-items: center; gap: 7px; font-size: 11px; color: #9aa3b2; }
+.ipm-state-txt.ok { color: #34d399; }
+.ipm-state-txt.bad { color: #f87171; }
+.ipm-cancel { padding: 4px 7px; border: none; border-radius: 6px; background: none; color: #9aa3b2;
+font: inherit; font-size: 11px; cursor: pointer; }
+.ipm-cancel:hover { color: #e8eaf0; background: rgba(255,255,255,.06); }
+.ipm-pop::-webkit-scrollbar { width: 8px; }
+.ipm-pop::-webkit-scrollbar-track { background: rgba(255,255,255,.04); border-radius: 8px; }
+.ipm-pop::-webkit-scrollbar-thumb { background: rgba(139,92,246,.45); border-radius: 8px; }
+.ipm-pop::-webkit-scrollbar-thumb:hover { background: rgba(139,92,246,.72); }
+.cam-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 14px; overflow: hidden;
   background: radial-gradient(circle at 50% 40%, #131a2c, #070911 70%); border: 1px solid var(--line); }
 .cam-stage img, .cam-stage video { position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: contain; transform-origin: 50% 50%; transition: filter .18s ease; background: transparent;
@@ -2785,32 +2935,37 @@ video { width: 100%; border-radius: 10px; background: #000; margin-bottom: 12px;
               <button class="jog" data-dx="1" data-dy="-1">&#8600;</button>
             </div>
             <div class="zcol">
-              <button class="zbtn" id="z-up"><span>&#9650;</span><span id="z-up-l">Bed up</span></button>
-              <div class="zread" id="zread"><b data-ms="z2">--</b><span>Z mm</span></div>
-              <button class="zbtn" id="z-down"><span>&#9660;</span><span id="z-down-l">Bed down</span></button>
-            </div>
+<button class="zbtn" id="z-up"><span>&#9650;</span><span id="z-up-l">Bed up</span></button>
+<button class="zbtn zhome" id="jog-home-z">Z</button>
+<button class="zbtn" id="z-down"><span>&#9660;</span><span id="z-down-l">Bed down</span></button>
+<div class="zread" id="zread" style="display:none"><b data-ms="z2">--</b><span>Z mm</span></div>
+</div>
           </div>
           <div class="hint" id="z-hint"></div>
-          <div class="pair" style="margin-top:12px">
-            <div>
-              <div class="rlabel"><span id="l-step-xy">XY step</span><b id="v-step-xy">1</b></div>
-              <div class="chips" id="chips-step-xy"></div>
-            </div>
-            <div>
-              <div class="rlabel"><span id="l-step-z">Z step</span><b id="v-step-z">1</b></div>
-              <div class="chips" id="chips-step-z"></div>
-            </div>
-          </div>
-          <div class="pair" style="margin-top:11px">
-            <div>
-              <div class="rlabel"><span id="l-speed-xy">XY speed</span><b id="v-speed-xy">50</b></div>
-              <div class="chips" id="chips-speed-xy"></div>
-            </div>
-            <div>
-              <div class="rlabel"><span id="l-speed-z">Z speed</span><b id="v-speed-z">10</b></div>
-              <div class="chips" id="chips-speed-z"></div>
-            </div>
-          </div>
+<div class="jogsets">
+<div class="jogset xy">
+<div class="jshead"><span class="jsax">XY</span><span class="jsnow" id="js-xy-now">--</span></div>
+<div class="row">
+<div class="rlabel"><span id="l-step-xy">XY step</span><b id="v-step-xy" style="display:none">1</b></div>
+<div class="chips steps" id="chips-step-xy"></div>
+</div>
+<div class="row">
+<div class="rlabel"><span id="l-speed-xy">XY speed</span><b id="v-speed-xy" style="display:none">50</b></div>
+<div class="chips speeds" id="chips-speed-xy"></div>
+</div>
+</div>
+<div class="jogset zz">
+<div class="jshead"><span class="jsax">Z</span><span class="jsnow" id="js-z-now">--</span></div>
+<div class="row">
+<div class="rlabel"><span id="l-step-z">Z step</span><b id="v-step-z" style="display:none">1</b></div>
+<div class="chips steps" id="chips-step-z"></div>
+</div>
+<div class="row">
+<div class="rlabel"><span id="l-speed-z">Z speed</span><b id="v-speed-z" style="display:none">10</b></div>
+<div class="chips speeds" id="chips-speed-z"></div>
+</div>
+</div>
+</div>
         </div>
 
         <div class="card sect">
@@ -2969,38 +3124,39 @@ video { width: 100%; border-radius: 10px; background: #000; margin-bottom: 12px;
     </div>
     <div class="side">
       <div class="card sect">
-        <h2><i class="bar vio"></i><span id="t-cam-source">Source</span></h2>
-        <div class="row">
-          <div class="rlabel"><span id="l-cam-mode">Transport</span></div>
-          <select class="inp full" id="cam-mode">
-            <option value="webrtc">WebRTC</option><option value="auto">Auto</option>
-            <option value="direct">MJPEG direct</option><option value="relay">MJPEG relay</option>
-          </select>
-        </div>
-        <div class="row">
-          <div class="rlabel"><span id="l-rtc-port">WebRTC port</span></div>
-          <input class="inp full" id="rtc-port" value="8000">
-        </div>
-        <div class="pair" style="margin-bottom:12px">
-          <button class="toggle" id="rtc-h264" style="width:100%">H.264 first</button>
-          <button class="btn ghost sm wide" id="cam-restart">Restart</button>
-        </div>
-        <div class="row"><select class="inp full" id="cam-src"></select></div>
-        <div class="row">
-          <div class="rlabel"><span id="l-cam-custom">Custom URL</span></div>
-          <input class="inp full" id="cam-url" placeholder="http://ip:4409/?action=stream">
-        </div>
-        <div class="pair">
-          <button class="btn cool sm wide" id="cam-apply">Apply</button>
-          <button class="btn ghost sm wide" id="cam-detect">Detect</button>
-        </div>
-        <div class="row" style="margin-top:12px">
-          <div class="rlabel"><span id="l-cam-fps">Relay frame rate</span><b id="v-cam-fps">8</b></div>
-          <input type="range" class="vio" id="cam-fps" min="1" max="15" step="1" value="8">
-        </div>
-        <button class="btn ghost sm wide" id="rtc-diag" style="margin-top:10px">Log diagnostics</button>
-        <div class="hint" id="cam-mode-hint"></div>
-      </div>
+<h2><i class="bar vio"></i><span id="t-cam-source">Source</span></h2>
+<div class="infobox">WebRTC &middot; port 8000</div>
+<button class="btn ghost sm wide" id="cam-restart" style="margin-top:12px">Restart</button>
+<button class="btn ghost sm wide" id="rtc-diag" style="margin-top:8px">Log diagnostics</button>
+<div class="hint" id="cam-mode-hint"></div>
+<div style="display:none">
+<div class="row">
+<div class="rlabel"><span id="l-cam-mode">Transport</span></div>
+<select class="inp full" id="cam-mode">
+<option value="webrtc">WebRTC</option><option value="auto">Auto</option>
+<option value="direct">MJPEG direct</option><option value="relay">MJPEG relay</option>
+</select>
+</div>
+<div class="row">
+<div class="rlabel"><span id="l-rtc-port">WebRTC port</span></div>
+<input class="inp full" id="rtc-port" value="8000">
+</div>
+<button class="toggle" id="rtc-h264">H.264 first</button>
+<div class="row"><select class="inp full" id="cam-src"></select></div>
+<div class="row">
+<div class="rlabel"><span id="l-cam-custom">Custom URL</span></div>
+<input class="inp full" id="cam-url" placeholder="">
+</div>
+<div class="pair">
+<button class="btn cool sm wide" id="cam-apply">Apply</button>
+<button class="btn ghost sm wide" id="cam-detect">Detect</button>
+</div>
+<div class="row">
+<div class="rlabel"><span id="l-cam-fps">Relay frame rate</span><b id="v-cam-fps">8</b></div>
+<input type="range" class="vio" id="cam-fps" min="1" max="15" step="1" value="8">
+</div>
+</div>
+</div>
       <div class="card sect">
         <h2><i class="bar cya"></i><span id="t-cam-view">View</span></h2>
         <div class="row">
@@ -3111,8 +3267,8 @@ var S = {
   macroQ: '', runSeen: 0, capsRendered: '', limSig: '', flowSig: '', calibSig: '',
   posSig: '', heatSig: ''
 };
-var STEPS_XY = [0.1, 1, 10, 50];
-var STEPS_Z = [0.05, 0.1, 1, 10];
+var STEPS_XY = [0.1, 1, 5, 10, 50];
+var STEPS_Z = [0.05, 0.1, 1, 5, 10, 50];
 var SPEEDS_XY = [10, 50, 100, 200];
 var SPEEDS_Z = [2, 5, 10, 25];
 var LENS = [1, 5, 10, 25, 50, 100];
@@ -3527,19 +3683,98 @@ function renderLock() {
   el('lock-lbl').className = locked ? 'locklbl' : 'locklbl open';
 }
 
-function renderJogControls() {
-  var j = S.jog;
-  chipRow('chips-step-xy', STEPS_XY, j.step, '', function(v) { j.step = v; renderJogControls(); });
-  chipRow('chips-speed-xy', SPEEDS_XY, j.speed, '', function(v) { j.speed = v; renderJogControls(); });
-  chipRow('chips-step-z', STEPS_Z, j.zstep, '', function(v) { j.zstep = v; renderJogControls(); });
-  chipRow('chips-speed-z', SPEEDS_Z, j.zspeed, '', function(v) { j.zspeed = v; renderJogControls(); });
-  el('v-step-xy').textContent = j.step + ' mm';
-  el('v-speed-xy').textContent = j.speed + ' mm/s';
-  el('v-step-z').textContent = j.zstep + ' mm';
-  el('v-speed-z').textContent = j.zspeed + ' mm/s';
-  renderLock();
-  updateMotionGates();
+
+function jogArrowSvg(angle) {
+return '<svg class="jico" viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+'<g transform="rotate(' + angle + ' 12 12)"><g class="jnudge">' +
+'<path d="M12 19 L12 5 M6.5 10.5 L12 5 L17.5 10.5"></path>' +
+'</g></g></svg>';
 }
+
+function jogZSvg(up) {
+var arrow = up ? 'M12 16.5 L12 5.5 M7 10.5 L12 5.5 L17 10.5'
+: 'M12 7.5 L12 18.5 M7 13.5 L12 18.5 L17 13.5';
+var bed = up ? 'M5.5 20.5 L18.5 20.5' : 'M5.5 3.5 L18.5 3.5';
+return '<svg class="jico zico" viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+'<g class="jnudge"><path d="' + arrow + '"></path></g>' +
+'<path class="jbed" d="' + bed + '"></path></svg>';
+}
+
+function jogIcons() {
+var pad = el('jogpad'), list, i, b, dx, dy, a, sp;
+if (pad) {
+list = pad.getElementsByTagName('button');
+for (i = 0; i < list.length; i++) {
+b = list[i];
+if (b.getAttribute('data-dx') === null) continue;
+if (b.getAttribute('data-ico') === '1') continue;
+dx = parseInt(b.getAttribute('data-dx'), 10) || 0;
+dy = parseInt(b.getAttribute('data-dy'), 10) || 0;
+a = Math.round(Math.atan2(dx, dy) * 180 / Math.PI);
+if (a < 0) a += 360;
+b.innerHTML = jogArrowSvg(a);
+b.setAttribute('data-ico', '1');
+}
+}
+b = el('z-up');
+if (b && b.getAttribute('data-ico') !== '1') {
+sp = b.getElementsByTagName('span')[0];
+if (sp) { sp.innerHTML = jogZSvg(true); b.setAttribute('data-ico', '1'); }
+}
+b = el('z-down');
+if (b && b.getAttribute('data-ico') !== '1') {
+sp = b.getElementsByTagName('span')[0];
+if (sp) { sp.innerHTML = jogZSvg(false); b.setAttribute('data-ico', '1'); }
+}
+}
+
+var JOGZ_TITLE = {
+en: 'Home Z axis (bed)',
+ru: 'Домой ось Z (стол)',
+zh: 'Z 轴归零（热床）'
+};
+
+/* Bind the Z home button once; refresh its tooltip on every language change. */
+function jogHomeZInit() {
+var b = el('jog-home-z');
+if (!b) return;
+b.setAttribute('title', JOGZ_TITLE[ipmLang()] || JOGZ_TITLE.en);
+if (b.getAttribute('data-bound') === '1') return;
+b.setAttribute('data-bound', '1');
+b.onclick = function() {
+if (this.disabled) return;
+send('home', { axes: 'z' });
+toast(t('sending'), 'info');
+};
+}
+
+function renderJogControls() {
+var j = S.jog;
+jogIcons();
+jogHomeZInit();
+chipRow('chips-step-xy', STEPS_XY, j.step, '', function(v) { j.step = v; renderJogControls(); });
+chipRow('chips-speed-xy', SPEEDS_XY, j.speed, '', function(v) { j.speed = v; renderJogControls(); });
+chipRow('chips-step-z', STEPS_Z, j.zstep, '', function(v) { j.zstep = v; renderJogControls(); });
+chipRow('chips-speed-z', SPEEDS_Z, j.zspeed, '', function(v) { j.zspeed = v; renderJogControls(); });
+el('v-step-xy').textContent = j.step + ' mm';
+el('v-speed-xy').textContent = j.speed + ' mm/s';
+el('v-step-z').textContent = j.zstep + ' mm';
+el('v-speed-z').textContent = j.zspeed + ' mm/s';
+el('js-xy-now').textContent = j.step + 'mm @ ' + j.speed + 'mm/s';
+el('js-z-now').textContent = j.zstep + 'mm @ ' + j.zspeed + 'mm/s';
+renderLock();
+updateMotionGates();
+}
+
+/* Mirror the XY home gate onto the Z home button without touching the original. */
+var k1cMotionGatesBase = updateMotionGates;
+updateMotionGates = function() {
+var xy, z;
+k1cMotionGatesBase();
+xy = el('jog-home-xy');
+z = el('jog-home-z');
+if (z && xy) z.disabled = xy.disabled;
+};
 
 function updateMotionGates() {
   var m = S.motion || {}, j = S.jog;
@@ -3937,12 +4172,325 @@ function applyThumbs(th) {
   if (changed && S.tab === 'files') renderFiles();
 }
 
+var IPM_TXT = {
+en: { set: 'Set printer IP', title: 'Printer connection',
+sub: 'Enter the K1C IP address. On the printer: Settings > Network > Wi-Fi.',
+ph: '192.168.1.50', go: 'Connect', cancel: 'Close',
+bad: 'Enter a valid IPv4 address, for example 192.168.1.50',
+sent: 'Connecting to ', online: 'Connected', offline: 'No connection',
+reconnecting: 'Reconnecting', fallback: 'HTTP fallback', unknown: 'Waiting for status',
+noteOff: 'check the IP address, make sure the printer is powered on and on the same network.',
+noteWarn: 'The native WebSocket link is down. The plugin is retrying and may be using the Moonraker HTTP fallback.' },
+ru: { set: 'Указать IP', title: 'Подключение к принтеру',
+sub: 'Введите IP-адрес K1C. На принтере: Настройки > Сеть > Wi-Fi.',
+ph: '192.168.1.50', go: 'Подключить', cancel: 'Закрыть',
+bad: 'Нужен IPv4-адрес, например 192.168.1.50',
+sent: 'Подключаюсь к ', online: 'Подключено', offline: 'Нет связи',
+reconnecting: 'Переподключение', fallback: 'Резерв HTTP', unknown: 'Ждём статус',
+noteOff: 'проверьте IP-адрес, убедитесь, что принтер включён и находится в той же сети.',
+noteWarn: 'Основной канал WebSocket недоступен. Плагин переподключается и может работать через резервный Moonraker HTTP.' },
+zh: { set: '设置 IP', title: '打印机连接',
+sub: '输入 K1C 的 IP 地址。打印机上：设置 > 网络 > Wi-Fi。',
+ph: '192.168.1.50', go: '连接', cancel: '关闭',
+bad: '请输入有效的 IPv4 地址，例如 192.168.1.50',
+sent: '正在连接 ', online: '已连接', offline: '未连接',
+reconnecting: '重新连接中', fallback: 'HTTP 备用', unknown: '等待状态',
+noteOff: '请检查 IP 地址，确认打印机已开机并处于同一网络。',
+noteWarn: '原生 WebSocket 已断开。插件正在重试，可能已切换到 Moonraker HTTP 备用通道。' }
+};
+
+function ipmLang() {
+var l = '', s;
+try { if (LANG) l = LANG; } catch (e) {}
+if (!l) { s = el('lang'); if (s && s.value) l = s.value; }
+l = String(l || 'en').toLowerCase();
+if (l.indexOf('ru') === 0) return 'ru';
+if (l.indexOf('zh') === 0) return 'zh';
+return 'en';
+}
+
+function ipmT(k) {
+var d = IPM_TXT[ipmLang()] || IPM_TXT.en;
+return d[k] || IPM_TXT.en[k] || k;
+}
+
+function ipmClean(v) { return String(v || '').replace(/^\s+|\s+$/g, ''); }
+
+function ipmValid(v) {
+var m = ipmClean(v).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/), i;
+if (!m) return false;
+for (i = 1; i <= 4; i++) { if (parseInt(m[i], 10) > 255) return false; }
+return true;
+}
+
+/* Fallback lookup for the diagnostics IP field if its id ever changes. */
+function ipmField() {
+var list = document.getElementsByTagName('input'), i;
+for (i = 0; i < list.length; i++) {
+if (list[i].id === 'ipm-inp') continue;
+if (ipmValid(list[i].value)) return list[i];
+}
+return null;
+}
+
+function ipmCurrent() {
+var f = el('c-ip');
+if (f && ipmValid(f.value)) return ipmClean(f.value);
+f = ipmField();
+return f ? ipmClean(f.value) : '';
+}
+
+/* Real link state published by snapshot(): transport + link_state. */
+function ipmLink() {
+var s = {}, tr, ls;
+try { s = S.status || {}; } catch (e) {}
+tr = String(s.transport || '').toLowerCase();
+ls = String(s.link_state || '').toLowerCase();
+if (tr === 'ws') return ls === 'connected' ? 'ok' : 'warn';
+if (tr === 'http') return 'warn';
+if (tr === 'offline') return 'bad';
+return '';
+}
+
+function ipmStateText(link) {
+var s = {};
+try { s = S.status || {}; } catch (e) {}
+if (link === 'ok') return ipmT('online');
+if (link === 'bad') return ipmT('offline');
+if (link === 'warn') {
+return String(s.transport || '') === 'http' ? ipmT('fallback') : ipmT('reconnecting');
+}
+return ipmT('unknown');
+}
+
+function ipmHost() {
+var a = el('btn-sound'), sel = ['.top', '.topbar', '.header', 'header'], i, list;
+if (a && a.parentNode) return { parent: a.parentNode, before: a };
+for (i = 0; i < sel.length; i++) {
+list = document.querySelectorAll(sel[i]);
+if (list && list.length) return { parent: list[0], before: null };
+}
+return null;
+}
+
+function ipmBuild() {
+var h, wrap, btn, dot, lab, car;
+if (el('ipm-btn')) return;
+h = ipmHost();
+if (!h) return;
+wrap = mk('div', 'ipm-wrap', ''); wrap.id = 'ipm-wrap';
+btn = mk('button', 'ipm-btn', ''); btn.id = 'ipm-btn'; btn.type = 'button';
+dot = mk('span', 'ipm-dot', ''); dot.id = 'ipm-dot';
+lab = mk('span', 'ipm-lab', ''); lab.id = 'ipm-lab';
+car = mk('span', 'ipm-car', '\u25BE');
+btn.appendChild(dot); btn.appendChild(lab); btn.appendChild(car);
+btn.onclick = ipmToggle;
+wrap.appendChild(btn);
+if (h.before) h.parent.insertBefore(wrap, h.before); else h.parent.appendChild(wrap);
+window.addEventListener('resize', ipmPlace, false);
+window.addEventListener('scroll', ipmPlace, true);
+ipmSync();
+}
+
+function ipmSync() {
+var btn = el('ipm-btn'), lab = el('ipm-lab'), dot = el('ipm-dot'),
+cur, link, label, cls, st, sd, note, s = {};
+if (!btn || !lab) return;
+try { s = S.status || {}; } catch (e) {}
+cur = ipmCurrent();
+link = ipmLink();
+label = ipmStateText(link);
+cls = link ? ' ' + link : '';
+btn.className = 'ipm-btn' + ((!cur || link === 'bad') ? ' bad' : cls);
+btn.title = ipmT('title') + ' \u2014 ' + label;
+lab.textContent = cur ? cur : ipmT('set');
+if (dot) dot.className = 'ipm-dot' + ((!cur || link === 'bad') ? ' bad' : cls);
+st = el('ipm-state-txt'); sd = el('ipm-state-dot');
+if (st) { st.textContent = label; st.className = 'ipm-state-txt' + cls; }
+if (sd) sd.className = 'ipm-dot' + cls;
+note = el('ipm-note');
+if (note) {
+note.innerHTML = '';
+if (link === 'bad' || !cur) {
+note.className = 'ipm-note show';
+note.appendChild(mk('b', '', ipmT('offline')));
+note.appendChild(document.createTextNode(' \u2014 ' + ipmT('noteOff')));
+if (s.err) note.appendChild(mk('div', 'ipm-err', String(s.err).substring(0, 150)));
+} else if (link === 'warn') {
+note.className = 'ipm-note show warn';
+note.appendChild(document.createTextNode(ipmT('noteWarn')));
+if (s.err) note.appendChild(mk('div', 'ipm-err', String(s.err).substring(0, 150)));
+} else {
+note.className = 'ipm-note';
+}
+}
+}
+
+function ipmPlace() {
+var btn = el('ipm-btn'), pop = el('ipm-pop'), vw, vh, r, w, h, left, top;
+if (!btn || !pop) return;
+vw = document.documentElement.clientWidth;
+vh = document.documentElement.clientHeight;
+r = btn.getBoundingClientRect();
+w = pop.offsetWidth; h = pop.offsetHeight;
+left = r.right - w;
+if (left + w > vw - 12) left = vw - w - 12;
+if (left < 12) left = 12;
+top = r.bottom + 8;
+if (top + h > vh - 12) { top = r.top - h - 8; if (top < 12) top = 12; }
+pop.style.left = left + 'px';
+pop.style.top = top + 'px';
+}
+
+function ipmMsg(text, ok) {
+var m = el('ipm-msg');
+if (!m) return;
+m.className = 'ipm-msg' + (ok ? ' ok' : '');
+if (text) m.textContent = text; else m.innerHTML = '&nbsp;';
+}
+
+function ipmClose() {
+var p = el('ipm-pop'), s = el('ipm-scrim');
+if (p && p.parentNode) p.parentNode.removeChild(p);
+if (s && s.parentNode) s.parentNode.removeChild(s);
+}
+
+function ipmToggle() { if (el('ipm-pop')) ipmClose(); else ipmOpen(); }
+
+function ipmOpen() {
+var btn = el('ipm-btn'), scrim, pop, head, field, inp, go, msg, note, foot, state, sd, stt, cancel;
+if (!btn || el('ipm-pop')) return;
+
+scrim = mk('div', 'ipm-scrim', ''); scrim.id = 'ipm-scrim';
+scrim.onclick = ipmClose;
+document.body.appendChild(scrim);
+
+pop = mk('div', 'ipm-pop', ''); pop.id = 'ipm-pop';
+head = mk('div', 'ipm-h', '');
+head.appendChild(mk('i', '', ''));
+head.appendChild(mk('span', '', ipmT('title')));
+pop.appendChild(head);
+pop.appendChild(mk('div', 'ipm-sub', ipmT('sub')));
+
+field = mk('div', 'ipm-field', '');
+inp = mk('input', 'ipm-inp', ''); inp.id = 'ipm-inp'; inp.type = 'text';
+inp.setAttribute('placeholder', ipmT('ph'));
+inp.setAttribute('autocomplete', 'off');
+inp.setAttribute('spellcheck', 'false');
+inp.value = ipmCurrent();
+go = mk('button', 'ipm-go', ipmT('go')); go.id = 'ipm-go'; go.type = 'button';
+go.onclick = ipmApply;
+field.appendChild(inp); field.appendChild(go);
+pop.appendChild(field);
+
+msg = mk('div', 'ipm-msg', ''); msg.id = 'ipm-msg'; msg.innerHTML = '&nbsp;';
+pop.appendChild(msg);
+
+note = mk('div', 'ipm-note', ''); note.id = 'ipm-note';
+pop.appendChild(note);
+
+foot = mk('div', 'ipm-foot', '');
+state = mk('div', 'ipm-state', '');
+sd = mk('span', 'ipm-dot', ''); sd.id = 'ipm-state-dot';
+stt = mk('span', 'ipm-state-txt', ''); stt.id = 'ipm-state-txt';
+state.appendChild(sd); state.appendChild(stt);
+cancel = mk('button', 'ipm-cancel', ipmT('cancel')); cancel.type = 'button';
+cancel.onclick = ipmClose;
+foot.appendChild(state); foot.appendChild(cancel);
+pop.appendChild(foot);
+
+inp.onkeydown = function(ev) {
+var e = ev || window.event, k = e.keyCode || e.which;
+if (k === 13) { ipmApply(); if (e.preventDefault) e.preventDefault(); return false; }
+if (k === 27) { ipmClose(); if (e.preventDefault) e.preventDefault(); return false; }
+};
+inp.oninput = function() { this.className = 'ipm-inp'; ipmMsg('', false); };
+
+document.body.appendChild(pop);
+ipmSync();
+ipmPlace();
+try { inp.focus(); inp.select(); } catch (e) {}
+}
+
+function ipmApply() {
+var inp = el('ipm-inp'), go = el('ipm-go'), v, f, port, path;
+if (!inp) return;
+v = ipmClean(inp.value);
+if (!ipmValid(v)) {
+inp.className = 'ipm-inp err';
+ipmMsg(ipmT('bad'), false);
+try { inp.focus(); inp.select(); } catch (e) {}
+return;
+}
+f = el('c-ip');
+if (f) f.value = v;
+port = el('c-port') ? (parseInt(el('c-port').value, 10) || 9999) : 9999;
+path = (el('c-path') && el('c-path').value) ? el('c-path').value : '/websocket';
+send('config', { ip: v, ws_port: port, ws_path: path, http_fallback: !!S.fb });
+ipmMsg(ipmT('sent') + v, true);
+if (go) go.disabled = true;
+try { toast(ipmT('sent') + v, 'info'); } catch (e) {}
+window.setTimeout(function() {
+try { if (typeof applyCamMode === 'function') applyCamMode(true); } catch (e) {}
+}, 600);
+window.setTimeout(ipmClose, 1200);
+}
+
+var LANG_TITLE = { en: 'Interface language', ru: 'Язык интерфейса', zh: '界面语言' };
+
+/* Compact language picker in the top bar. Applies instantly, no reload. */
+function langBuild() {
+var anchor = el('btn-sound'), wrap, sel, opts, i, o;
+if (el('lang-sel')) return;
+if (!anchor || !anchor.parentNode) return;
+wrap = mk('div', 'ipm-wrap', '');
+sel = mk('select', 'inp', '');
+sel.id = 'lang-sel';
+sel.style.cssText = 'height:30px;padding:0 9px;font-size:11.5px;font-weight:700;' +
+'border-radius:999px;width:auto;cursor:pointer;';
+opts = [['en', 'English'], ['ru', 'Русский'], ['zh', '中文']];
+for (i = 0; i < opts.length; i++) {
+o = mk('option', null, opts[i][1]);
+o.value = opts[i][0];
+sel.appendChild(o);
+}
+sel.value = LANG;
+sel.title = LANG_TITLE[LANG] || LANG_TITLE.en;
+sel.onchange = function() {
+var v = this.value;
+send('ui_lang', { lang: v });
+applyUiLang(v);
+};
+wrap.appendChild(sel);
+anchor.parentNode.insertBefore(wrap, anchor);
+}
+
+function applyUiLang(v) {
+var s;
+if (v !== 'en' && v !== 'ru' && v !== 'zh') return;
+if (v === LANG) return;
+LANG = v;
+S.calibSig = ''; S.capsRendered = ''; S.limSig = ''; S.flowSig = '';
+S.posSig = ''; S.heatSig = ''; S.badgeKey = '';
+applyLang();
+renderFiles(); renderHistory(); renderCamSources(); renderCamStats();
+renderMotionState();
+s = el('lang-sel');
+if (s) { s.value = v; s.title = LANG_TITLE[v] || LANG_TITLE.en; }
+}
+
 function renderMediaState() {
-  var m = S.media || {};
-  var s = m.busy ? t('media_finding') : (m.base ? (m.base + (m.prefix || '') + '  ·  strip ' + (m.strip || 0)) : t('media_missing'));
-  el('h-media-state').textContent = s;
-  el('h-media').disabled = !!m.busy;
-  el('c-media').disabled = !!m.busy;
+var m = S.media || {};
+var hb = el('h-media');
+if (hb && hb.parentNode && hb.parentNode.style.display !== 'none') {
+hb.parentNode.style.display = 'none';
+}
+el('h-media-state').textContent = '';
+el('h-media').disabled = !!m.busy;
+el('c-media').disabled = !!m.busy;
+ipmBuild();
+ipmSync();
+langBuild();
 }
 
 function renderHistory() {
@@ -3989,13 +4537,9 @@ function renderHDetail() {
       if (v.parentNode) v.parentNode.replaceChild(mk('div', 'warnbox', t('video_fail') + ' [code ' + code + '] ' + msg), v);
     };
     box.appendChild(v);
-  } else if (h.video_path) {
-    box.appendChild(mk('div', 'warnbox', t('media_missing')));
-    var fb = mk('button', 'btn ghost sm wide', t('media_find'));
-    fb.style.marginTop = '8px';
-    fb.onclick = function() { send('media_probe', {}); toast(t('media_finding'), 'info'); };
-    box.appendChild(fb);
-  }
+} else if (h.video_path) {
+box.appendChild(mk('div', 'warnbox', t('video_fail')));
+}
   box.appendChild(drow(t('material'), h.material || t('na')));
   box.appendChild(drow(h.finish ? t('finished') : t('failed'), fmtDate(h.start)));
   box.appendChild(drow(t('total_time'), fmtTime(h.total)));
@@ -4877,6 +5421,24 @@ window.addEventListener('load', function() {
         action = data.get("action")
         payload = data.get("data", {}) or {}
 
+        if action == "ui_lang":
+            want = normalize_lang(payload.get("lang"))
+            if want:
+                CFG["ui_lang"] = want
+                save_cfg()
+                try:
+                    cur = json.loads(self.get_config() or "{}")
+                    if not isinstance(cur, dict):
+                        cur = {}
+                except Exception:
+                    cur = {}
+                cur["language"] = want
+                try:
+                    self.save_config(json.dumps(cur))
+                except Exception as exc:
+                    log("ui_lang: save_config failed: " + str(exc)[:80])
+                log("ui_lang -> " + want)
+            return orca.ExecutionResult.success()
         if action == "jslog":
             log("JS: " + str(payload.get("msg", ""))[:1200])
             return orca.ExecutionResult.success()
@@ -5044,10 +5606,17 @@ window.addEventListener('load', function() {
                 f.write(raw)
                 f.close()
                 log("webrtc snapshot saved: " + name)
-                shutter_sound = CFG.get("sound", True)
+                # Feed the same result channel the MJPEG path uses, so the UI
+                # plays the shutter and shows the "saved" toast on the next poll.
+                with LOCK:
+                    CAM["snap_result"] = {"ok": True, "name": name, "ts": time.time()}
+                    CAM["snap_busy"] = False
                 self.post_message({"type": "cam_snap_img", "name": name, "jpeg": jpeg_data})
             except Exception as e:
                 log("webrtc snapshot save failed: " + str(e)[:80])
+                with LOCK:
+                    CAM["snap_result"] = {"ok": False, "name": "", "ts": time.time()}
+                    CAM["snap_busy"] = False
             return orca.ExecutionResult.success()
 
         if action == "cam_snap_view":
@@ -5206,8 +5775,268 @@ window.addEventListener('load', function() {
 
         return orca.ExecutionResult.skipped()
 
-
 @orca.plugin
 class K1CControllerPlugin(orca.base):
     def register_capabilities(self):
         orca.register_capability(K1CControlPage)
+
+# ---------------------------------------------------------------------------
+# Native tab icon for the K1C Hub page.
+# The SVG is embedded as text: no network access, no downloads, no external
+# asset files. Works fully offline and cannot fail on a missing resource.
+# Host signature: get_icon(self) -> str, same markup-as-string convention
+# as get_ui() / get_config_ui().
+# ---------------------------------------------------------------------------
+K1C_TAB_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+    '<rect x="2.5" y="3" width="19" height="2.4" rx="1.2" fill="#8C8C8C"/>'
+    '<rect x="2.5" y="3" width="2.4" height="18" rx="1.2" fill="#8C8C8C"/>'
+    '<rect x="19.1" y="3" width="2.4" height="18" rx="1.2" fill="#8C8C8C"/>'
+    '<rect x="4.9" y="8.2" width="14.2" height="1.8" rx="0.9" fill="#8C8C8C"/>'
+    '<path d="M10 10.4 h4 v2.6 l-2 2.8 l-2 -2.8 z" fill="#8C8C8C"/>'
+    '<rect x="5.6" y="17.6" width="12.8" height="2.4" rx="1.2" fill="#8C8C8C"/>'
+    '</svg>'
+)
+
+
+def _k1c_write_icon_file():
+    """Materialise the embedded icon on disk. Used only as a path fallback."""
+    try:
+        folder = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(folder, "k1c_hub.svg")
+        f = open(path, "w", encoding="utf-8")
+        f.write(K1C_TAB_ICON_SVG)
+        f.close()
+        return path
+    except Exception:
+        return ""
+
+
+K1C_TAB_ICON_PATH = _k1c_write_icon_file()
+
+
+def _k1c_page_get_icon(self):
+    return K1C_TAB_ICON_PATH
+
+
+try:
+    K1CControlPage.get_icon = _k1c_page_get_icon
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
+# UI language. Explicit user choice wins over the host locale.
+# Persisted twice: CFG["ui_lang"] in k1c_config.json and the capability config
+# exposed in the Plugins dialog. Accepted values: auto / en / ru / zh.
+# ---------------------------------------------------------------------------
+def normalize_lang(value):
+    v = str(value or "").strip().lower()
+    return v if v in ("en", "ru", "zh", "auto") else ""
+
+
+def detect_host_lang():
+    """Read the host UI language and log what it actually reports."""
+    raw = ""
+    try:
+        info = orca.host.app_info()
+        if isinstance(info, dict):
+            raw = info.get("ui_language", "")
+        else:
+            raw = getattr(info, "ui_language", "")
+    except Exception as exc:
+        log("lang: app_info unavailable: " + str(exc)[:80])
+        return "en"
+    text = str(raw or "").strip().lower()
+    log("lang: host ui_language = '" + text[:40] + "'")
+    if text.startswith("ru") or "russ" in text or "\u0440\u0443\u0441" in text:
+        return "ru"
+    if text.startswith("zh") or "chin" in text or "hans" in text or "\u4e2d" in text:
+        return "zh"
+    return "en"
+
+
+def resolve_ui_lang(page):
+    want = ""
+    try:
+        stored = json.loads(page.get_config() or "{}")
+        if isinstance(stored, dict):
+            want = normalize_lang(stored.get("language"))
+    except Exception:
+        want = ""
+    if not want:
+        want = normalize_lang(CFG.get("ui_lang"))
+    if want and want != "auto":
+        return want
+    return detect_host_lang()
+
+
+K1C_CFG_UI = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 18px; font-size: 13px;
+font-family: var(--orca-font, "Segoe UI", sans-serif);
+background: var(--orca-bg, #0b0d16); color: var(--orca-fg, #e9ecf8); }
+.box { max-width: 540px; }
+h1 { margin: 0 0 5px; font-size: 16px; display: flex; align-items: center; gap: 9px; }
+h1 i { display: block; width: 4px; height: 16px; border-radius: 3px;
+background: linear-gradient(180deg, #b18cff, #4fe3ff); }
+.sub { font-size: 11.5px; line-height: 1.55; margin-bottom: 16px;
+color: var(--orca-muted, #8d95b4); }
+.lab { font-size: 10px; text-transform: uppercase; letter-spacing: 1.1px;
+margin-bottom: 8px; color: var(--orca-muted, #8d95b4); }
+.opts { display: flex; flex-direction: column; gap: 7px; margin-bottom: 16px; }
+.opt { display: flex; align-items: center; gap: 11px; padding: 11px 13px;
+border-radius: 11px; cursor: pointer; transition: all .15s;
+border: 1px solid var(--orca-border, #232842); background: rgba(255,255,255,0.04); }
+.opt:hover { border-color: rgba(177,140,255,0.55); }
+.opt.on { border-color: #b18cff; background: rgba(177,140,255,0.14); }
+.rad { width: 16px; height: 16px; border-radius: 50%; flex: none;
+border: 2px solid #5a6180; position: relative; }
+.opt.on .rad { border-color: #b18cff; }
+.opt.on .rad:after { content: ""; position: absolute; inset: 3px; border-radius: 50%;
+background: linear-gradient(135deg, #b18cff, #4fe3ff); }
+.nm { flex: 1; font-size: 12.5px; font-weight: 600; }
+.tag { font-size: 9.5px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;
+color: var(--orca-muted, #8d95b4); }
+.foot { display: flex; align-items: center; gap: 12px; }
+.btn { border: none; border-radius: 9px; padding: 9px 18px; font-size: 12.5px;
+font-weight: 700; cursor: pointer; font-family: inherit; color: #fff;
+background: linear-gradient(135deg, #7c5cff, #3b7bff); }
+.btn:hover { filter: brightness(1.12); }
+.btn:disabled { opacity: .45; cursor: default; filter: none; }
+.msg { font-size: 11.5px; color: var(--orca-muted, #8d95b4); }
+.msg.ok { color: #3fe08c; }
+.msg.err { color: #ff4d5e; }
+.note { margin-top: 14px; padding: 10px 12px; border-radius: 10px;
+font-size: 11px; line-height: 1.5; background: rgba(79,227,255,0.07);
+border: 1px solid rgba(79,227,255,0.26); color: var(--orca-muted, #8d95b4); }
+</style></head><body><div class="box">
+<h1><i></i><span>K1C Hub</span></h1>
+<div class="sub" id="sub"></div>
+<div class="lab" id="lab"></div>
+<div class="opts" id="opts"></div>
+<div class="foot"><button class="btn" id="save">Save</button><span class="msg" id="msg"></span></div>
+<div class="note" id="note"></div>
+</div>
+<script>
+var TXT = {
+en: { sub: 'Interface language of the K1C Hub page.', lab: 'Language', save: 'Save',
+saved: 'Saved. Reopen the plugin page to apply.', failed: 'Could not save the setting.',
+note: 'Auto follows the OrcaSlicer interface language. Detected now: __HOSTLANG__.',
+bridge: 'Configuration bridge is unavailable in this window.',
+auto: 'Auto (follow OrcaSlicer)', en: 'English', ru: 'Russian', zh: 'Chinese' },
+ru: { sub: 'Язык интерфейса страницы K1C Hub.', lab: 'Язык', save: 'Сохранить',
+saved: 'Сохранено. Откройте страницу плагина заново.', failed: 'Не удалось сохранить настройку.',
+note: 'Авто следует языку интерфейса OrcaSlicer. Сейчас определён: __HOSTLANG__.',
+bridge: 'Мост конфигурации недоступен в этом окне.',
+auto: 'Авто (как в OrcaSlicer)', en: 'Английский', ru: 'Русский', zh: 'Китайский' },
+zh: { sub: 'K1C Hub 页面的界面语言。', lab: '语言', save: '保存',
+saved: '已保存。请重新打开插件页面。', failed: '无法保存设置。',
+note: '自动跟随 OrcaSlicer 界面语言。当前检测为：__HOSTLANG__。',
+bridge: '此窗口中的配置桥接不可用。',
+auto: '自动（跟随 OrcaSlicer）', en: '英语', ru: '俄语', zh: '中文' }
+};
+var LANGS = ['auto', 'en', 'ru', 'zh'];
+var pick = 'auto';
+var api = window.orca || {};
+
+function el(id) { return document.getElementById(id); }
+function mk(tag, cls, text) {
+var e = document.createElement(tag);
+if (cls) e.className = cls;
+if (text !== undefined && text !== null) e.appendChild(document.createTextNode(text));
+return e;
+}
+function txt(k) { var d = TXT[pick] || TXT.en; return d[k] || TXT.en[k] || k; }
+
+function paint() {
+var box = el('opts'), i;
+el('sub').textContent = txt('sub');
+el('lab').textContent = txt('lab');
+el('save').textContent = txt('save');
+el('note').textContent = txt('note');
+box.innerHTML = '';
+for (i = 0; i < LANGS.length; i++) {
+(function(code) {
+var row = mk('div', 'opt' + (pick === code ? ' on' : ''));
+row.appendChild(mk('div', 'rad'));
+row.appendChild(mk('div', 'nm', txt(code)));
+row.appendChild(mk('div', 'tag', code === 'auto' ? '' : code));
+row.onclick = function() { pick = code; paint(); };
+box.appendChild(row);
+})(LANGS[i]);
+}
+}
+
+/* The bridge may be sync or promise-based; support both shapes. */
+function parseCfg(v) {
+if (!v) return {};
+if (typeof v === 'string') { try { return JSON.parse(v) || {}; } catch (e) { return {}; } }
+if (typeof v === 'object') return v;
+return {};
+}
+function loadCfg(done) {
+var r;
+if (!api.getConfig) { done({}); return; }
+try { r = api.getConfig(); } catch (e) { done({}); return; }
+if (r && typeof r.then === 'function') {
+r.then(function(v) { done(parseCfg(v)); })['catch'](function() { done({}); });
+} else { done(parseCfg(r)); }
+}
+function saveCfg(obj, done) {
+var r;
+if (!api.saveConfig) { done(false); return; }
+try { r = api.saveConfig(JSON.stringify(obj)); }
+catch (e) {
+try { r = api.saveConfig(obj); } catch (e2) { done(false); return; }
+}
+if (r && typeof r.then === 'function') {
+r.then(function(v) { done(v !== false); })['catch'](function() { done(false); });
+} else { done(r !== false); }
+}
+
+function init() {
+paint();
+loadCfg(function(cfg) {
+var v = String(cfg.language || 'auto').toLowerCase();
+pick = LANGS.indexOf(v) >= 0 ? v : 'auto';
+paint();
+if (!api.saveConfig) {
+el('msg').className = 'msg err';
+el('msg').textContent = txt('bridge');
+el('save').disabled = true;
+}
+});
+el('save').onclick = function() {
+var btn = this;
+btn.disabled = true;
+loadCfg(function(cfg) {
+cfg.language = pick;
+saveCfg(cfg, function(ok) {
+btn.disabled = false;
+el('msg').className = 'msg ' + (ok ? 'ok' : 'err');
+el('msg').textContent = ok ? txt('saved') : txt('failed');
+});
+});
+};
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
+</script>
+</body></html>"""
+
+
+def _k1c_has_config_ui(self):
+    return True
+
+
+def _k1c_get_config_ui(self):
+    names = {"en": "English", "ru": "Russian", "zh": "Chinese"}
+    return K1C_CFG_UI.replace("__HOSTLANG__", names.get(detect_host_lang(), "English"))
+
+
+try:
+    K1CControlPage.has_config_ui = _k1c_has_config_ui
+    K1CControlPage.get_config_ui = _k1c_get_config_ui
+except Exception:
+    pass
